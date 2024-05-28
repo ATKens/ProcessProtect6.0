@@ -1,6 +1,6 @@
 #include <ntifs.h>
 #include "ProcessInformation.h"
-
+#include "peb.h"
 
 
 #define DEVICE_NAME L"\\device\\ProcessProtect"
@@ -13,18 +13,33 @@
 	CTL_CODE(FILE_DEVICE_UNKNOWN, IOCTRL_BASE+i, METHOD_BUFFERED,FILE_ANY_ACCESS)
 
 #define CTL_START MYIOCTRL_CODE(0)
-#define CTL_PRINT MYIOCTRL_CODE(1)
-#define CTL_BYE MYIOCTRL_CODE(2)
-
-#define CTL_BYE3 MYIOCTRL_GITTEST(3)
-#define CTL_BYE4 MYIOCTRL_GITTEST(4)
-#define CTL_BYE5 MYIOCTRL_GITTEST(5)
+#define CTL_REBOOT MYIOCTRL_CODE(1)
+#define CTL_CHECK_PE MYIOCTRL_CODE(2)
+#define CTL_BYE MYIOCTRL_CODE(3)
 
 
-KDPC g_dpc;
-KTIMER g_timer;
-int g_flag=0;
-int g_Shutdown_flag = 0;
+#define XOR_SWAP_STRING_ELEMENTS(arr1, arr2, size) \
+    do { \
+        for (size_t i = 0; i < size; ++i) { \
+            (arr1)[i] = (arr1)[i] ^ (arr2)[i]; \
+            (arr2)[i] = (arr1)[i] ^ (arr2)[i]; \
+            (arr1)[i] = (arr1)[i] ^ (arr2)[i]; \
+        } \
+    } while (0)
+
+//进程重启相关申明
+#define ACCESS_ZERO (*(volatile int *)0 = 0)
+
+enum FIRMWARE_REENTRY
+{
+	HalHaltRoutine,
+	HalPowerDownRoutine,
+	HalRestartRoutine,
+	HalRebootRoutine,
+	HalInteractiveModeRoutine,
+	HalMaximumRoutine
+} FIRMWARE_REENTRY, * PFIRMWARE_REENTRY;
+
 
 typedef struct _SAVE_STRUCT
 {
@@ -32,7 +47,25 @@ typedef struct _SAVE_STRUCT
 	WCHAR str[50];
 }SAVE_STRUCT, * PSAVE_STRUCT;
 
-SAVE_STRUCT g_save = { 0 };
+typedef struct _DEVICE_EXTENSION {
+	KDPC g_dpc;
+	KTIMER g_timer;
+	int g_flag;
+	int g_Shutdown_flag;
+	SAVE_STRUCT g_save;
+	KSPIN_LOCK g_SpinLock;
+} DEVICE_EXTENSION, * PDEVICE_EXTENSION;
+
+/*
+KDPC g_dpc;
+KTIMER g_timer;
+int g_flag=0;
+int g_Shutdown_flag = 0;
+*/
+
+
+//KSPIN_LOCK GlobalSpinLock;
+
 
 PVOID pRegistrationHandle;
 //进程管理器详细界面结束代码
@@ -84,6 +117,14 @@ typedef   enum   _SHUTDOWN_ACTION {
 }SHUTDOWN_ACTION;
 
 
+
+
+typedef void (*VoidFunctionPointer)();
+
+VOID HalReturnToFirmware(
+	IN enum FIRMWARE_REENTRY  Routine
+);
+
 NTSTATUS NTAPI NtShutdownSystem(IN SHUTDOWN_ACTION Action);
 
 
@@ -108,7 +149,7 @@ NTSTATUS EnumSystemProcess(IN PWCH TargetProcessName);
 
 PUCHAR NTAPI PsGetProcessImageFileName(__in PEPROCESS Process);
 
-NTSTATUS InitTargetProcessNameR(IN PSAVE_STRUCT SaveBuff);
+NTSTATUS InitTargetProcessNameR(IN PSAVE_STRUCT SaveBuff, PDEVICE_OBJECT pObject);
 
 
 NTSTATUS NTAPI NtQueryInformationProcess(_In_ HANDLE 	ProcessHandle,
@@ -120,12 +161,19 @@ NTSTATUS NTAPI NtQueryInformationProcess(_In_ HANDLE 	ProcessHandle,
 
 
 
-VOID IsFun();
-VOID IsProcessActive();
+VOID IsFun(PDEVICE_OBJECT pObject);
+VOID IsProcessActive(PDEVICE_OBJECT pObject);
 
-VOID ShutDownRuntime();
-VOID CreateSystemThreadShutDown();
+VOID ShutDownRuntime(PDEVICE_OBJECT pObject);
+VOID CreateSystemThreadCommonInterface(VoidFunctionPointer function, PDEVICE_OBJECT pObject);
+VOID CheckPE();
+VOID ShutDownRuntimeDirect();
+VOID CallBackRegedit(PDRIVER_OBJECT pDriver, PDEVICE_EXTENSION deviceExtension);
 
+
+
+// 定义导出
+NTKERNELAPI PVOID NTAPI PsGetProcessPeb(_In_ PEPROCESS Process);
 
 #pragma LOCKEDCODE
 void DpcRoutine(
@@ -133,22 +181,14 @@ void DpcRoutine(
 	PVOID DeferredContext,
 	PVOID SysArg1,
 	PVOID SysArg2) {
-	//LARGE_INTEGER dueTime;
-	//dueTime.QuadPart = -10000000;
+	KIRQL oldIrql;
 	KdPrint(("In DpcRoutine.\n"));
 
-	//KeLowerIrql(PASSIVE_LEVEL);
-	//KeSetTimer(&g_timer, dueTime, &g_dpc); // 在DPC回调最后调用KeSetTimer使得可以反复调用
-	// 
-	// 
-	//PopShutdownSystem(PopAction.Action);
-	//PopSetSystemPowerState(PowerSystemShutdown, ShutdownReboot);
-	//重启
-	//NtShutdownSystem(ShutdownReboot);
+	PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)DeferredContext;
 
-
-	g_Shutdown_flag = 1;
-
+	KeAcquireSpinLock(&deviceExtension->g_SpinLock, &oldIrql);
+	deviceExtension->g_Shutdown_flag = 1;
+	KeReleaseSpinLock(&deviceExtension->g_SpinLock, oldIrql);
 }
 
 OB_PREOP_CALLBACK_STATUS PreProcessHandle(
@@ -157,10 +197,13 @@ OB_PREOP_CALLBACK_STATUS PreProcessHandle(
 )
 {
 
-	UNREFERENCED_PARAMETER(RegistrationContext);
-	HANDLE pid = PsGetProcessId((PEPROCESS)pOperationInformation->Object);
+	//UNREFERENCED_PARAMETER(RegistrationContext);
 
-	if (pid!=0 && pid == g_save.g_save_pid)
+	PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)RegistrationContext;
+	HANDLE pid = PsGetProcessId((PEPROCESS)pOperationInformation->Object);
+	
+
+	if (pid!=0 && pid == deviceExtension->g_save.g_save_pid)
 	{
 		if (pOperationInformation->Operation == OB_OPERATION_HANDLE_CREATE)
 		{
@@ -187,61 +230,6 @@ OB_PREOP_CALLBACK_STATUS PreProcessHandle(
 }
 
 
-VOID CallBackRegedit(PDRIVER_OBJECT pDriver)
-{
-
-	OB_OPERATION_REGISTRATION oor;
-	OB_CALLBACK_REGISTRATION ocr;
-	PLDR_DATA pld;//指向_LDR_DATA_TABLE_ENTRY结构体的指针
-
-	//初始化
-	pRegistrationHandle = 0;
-	RtlZeroMemory(&oor, sizeof(OB_OPERATION_REGISTRATION));
-	RtlZeroMemory(&ocr, sizeof(OB_CALLBACK_REGISTRATION));
-
-
-	//初始化 OB_OPERATION_REGISTRATION 
-
-	//设置监听的对象类型
-	oor.ObjectType = PsProcessType;
-	//设置监听的操作类型
-	oor.Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
-	//设置操作发生前执行的回调
-	oor.PreOperation = PreProcessHandle;
-	//设置操作发生前执行的回调
-	//oor.PostOperation = ?
-
-	//初始化 OB_CALLBACK_REGISTRATION 
-
-	// 设置版本号，必须为OB_FLT_REGISTRATION_VERSION
-	ocr.Version = OB_FLT_REGISTRATION_VERSION;
-	//设置自定义参数，可以为NULL
-	ocr.RegistrationContext = NULL;
-	// 设置回调函数个数
-	ocr.OperationRegistrationCount = 1;
-	//设置回调函数信息结构体,如果个数有多个,需要定义为数组.
-	ocr.OperationRegistration = &oor;
-	RtlInitUnicodeString(&ocr.Altitude, L"321000"); // 设置加载顺序
-
-
-
-	// 绕过MmVerifyCallbackFunction。
-	pld = (PLDR_DATA)pDriver->DriverSection;
-	pld->Flags |= 0x20;
-
-
-	if (NT_SUCCESS(ObRegisterCallbacks(&ocr, &pRegistrationHandle)))
-	{
-		KdPrint(("ObRegisterCallbacks注册成功"));
-	}
-	else
-	{
-		KdPrint(("ObRegisterCallbacks失败"));
-	}
-
-}
-
-
 NTSTATUS DispatchCommon(PDEVICE_OBJECT pObject, PIRP pIrp)
 {
 	pIrp->IoStatus.Status = STATUS_SUCCESS; // 返回给应用层
@@ -250,6 +238,17 @@ NTSTATUS DispatchCommon(PDEVICE_OBJECT pObject, PIRP pIrp)
 	IoCompleteRequest(pIrp, IO_NO_INCREMENT);
 
 	return STATUS_SUCCESS; // 返回给内核层IO管理器
+}
+
+NTSTATUS CreateDispatch(
+	IN PDEVICE_OBJECT DeviceObject,
+	IN PIRP Irp
+)
+{
+	Irp->IoStatus.Status = STATUS_SUCCESS;
+	Irp->IoStatus.Information = 0;
+	IoCompleteRequest(Irp, IO_NO_INCREMENT);
+	return STATUS_SUCCESS;
 }
 
 
@@ -271,21 +270,32 @@ NTSTATUS DispatchIoctrl(PDEVICE_OBJECT pObject, PIRP pIrp)
 	uInputLength = pStack->Parameters.DeviceIoControl.InputBufferLength;
 	uOutputLength = pStack->Parameters.DeviceIoControl.OutputBufferLength;
 
-
+	
 	uIoctrlCode = pStack->Parameters.DeviceIoControl.IoControlCode;
-
 	switch (uIoctrlCode)
 	{
-	case CTL_START:
-		InitTargetProcessNameR(pOutputBuff);
-		
-		IsProcessActive();
-
-
-		CreateSystemThreadShutDown();
+	case CTL_START://判断RTCDesktop.exe是否存在
+		InitTargetProcessNameR(pOutputBuff, pObject);
+		IsProcessActive(pObject);
+		CreateSystemThreadCommonInterface(ShutDownRuntime, pObject);
 		break;
-	case CTL_PRINT:
-		DbgPrint("%ws\n", (WCHAR*)pInputBuff);
+		
+	case CTL_REBOOT://直接重启接口
+
+#if DBG
+		AsmInt3();
+#endif
+		CreateSystemThreadCommonInterface(ShutDownRuntimeDirect, pObject);
+		break;
+	case CTL_CHECK_PE://检测指纹是否符合，不符合重启
+
+#if DBG
+		AsmInt3();
+#endif
+		KdPrint(("in CTL_CHECK_PE\n"));
+
+		CreateSystemThreadCommonInterface(CheckPE, pObject);
+
 		break;
 	case CTL_BYE:
 		DbgPrint("Goodbye iocontrol\n");
@@ -307,7 +317,6 @@ NTSTATUS DispatchIoctrl(PDEVICE_OBJECT pObject, PIRP pIrp)
 VOID DriverUnload(PDRIVER_OBJECT pDriverObject)
 {
 	
-	
 	DbgPrint("Driver unloaded\n");
 
 
@@ -318,17 +327,43 @@ VOID DriverUnload(PDRIVER_OBJECT pDriverObject)
 		pRegistrationHandle = NULL;
 	}
 
-	NtShutdownSystem(ShutdownReboot);
+
+	PDEVICE_OBJECT pDeviceObject = pDriverObject->DeviceObject;
+
+	// 删除所有设备对象
+	while (pDeviceObject != NULL) {
+		PDEVICE_EXTENSION pDeviceExtension = (PDEVICE_EXTENSION)pDeviceObject->DeviceExtension;
+		
+		// 释放设备扩展中的资源
+		// 例如：如果有定时器，调用 KeCancelTimer(&pDeviceExtension->MyTimer);
+
+		// 删除符号链接（如果有）
+		UNICODE_STRING uLinkName;
+		RtlInitUnicodeString(&uLinkName, LINK_NAME);
+		IoDeleteSymbolicLink(&uLinkName);
+
+		// 获取下一个设备对象
+		PDEVICE_OBJECT pNextDevice = pDeviceObject->NextDevice;
+		IoDeleteDevice(pDeviceObject);
+		pDeviceObject = pNextDevice;
+	}
 
 
+	//NtShutdownSystem(ShutdownReboot);
+	//ACCESS_ZERO;
+	//HalReturnToFirmware(HalPowerDownRoutine);
+	HalReturnToFirmware(HalRebootRoutine);
 }
+
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject,
 	PUNICODE_STRING pRegPath)
 {
+/*
 #if DBG
 	AsmInt3();
 #endif
+*/
 	UNICODE_STRING uDeviceName = { 0 };
 	UNICODE_STRING uLinkName = { 0 };
 	NTSTATUS ntStatus = 0;
@@ -341,7 +376,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject,
 	RtlInitUnicodeString(&uLinkName, LINK_NAME);
 
 	ntStatus = IoCreateDevice(pDriverObject,
-		0, &uDeviceName, FILE_DEVICE_UNKNOWN, 0, FALSE, &pDeviceObject);
+		sizeof(DEVICE_EXTENSION), &uDeviceName, FILE_DEVICE_UNKNOWN, 0, FALSE, &pDeviceObject);
 
 	if (!NT_SUCCESS(ntStatus))
 	{
@@ -367,13 +402,24 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject,
 	{
 		pDriverObject->MajorFunction[i] = DispatchCommon;
 	}
-
 	pDriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = DispatchIoctrl;
-
+	pDriverObject->MajorFunction[IRP_MJ_CREATE] = CreateDispatch;
 	pDriverObject->DriverUnload = DriverUnload;
-
-
 	
+
+	// 清零设备扩展
+	PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)pDeviceObject->DeviceExtension;
+	RtlZeroMemory(deviceExtension, sizeof(DEVICE_EXTENSION));
+
+	// 初始化设备扩展中的变量
+	KeInitializeDpc(&deviceExtension->g_dpc, DpcRoutine, deviceExtension); // 初始化KDPC对象并设置回调函数
+	KeInitializeTimer(&deviceExtension->g_timer); // 初始化定时器对象
+	deviceExtension->g_flag = 0;
+	deviceExtension->g_Shutdown_flag = 0;
+	SAVE_STRUCT g_save = { 0 };
+	KeInitializeSpinLock(&deviceExtension->g_SpinLock);
+
+
 	//CallBackRegedit(pDriverObject);
 
 	DbgPrint("Driver load ok!\n");
@@ -381,10 +427,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject,
 	return STATUS_SUCCESS;
 }
 
-
-
-
-VOID IsProcessActive()
+VOID IsProcessActive(PDEVICE_OBJECT pObject)
 {
 	KdPrint(("In IsProcessActive.\n"));
 	HANDLE hThread;
@@ -398,7 +441,7 @@ VOID IsProcessActive()
 			(HANDLE)0,
 			NULL,
 			IsFun,
-			NULL
+			pObject
 		);
 
 	NTSTATUS st;
@@ -428,16 +471,10 @@ VOID IsProcessActive()
 	*/
 
 	return;
-
-
 }
 
-
-
-
-VOID IsFun()
+VOID IsFun(PDEVICE_OBJECT pObject)
 {
-
 	KdPrint(("In IsFun.\n"));
 
 	// 遍历进程
@@ -446,48 +483,42 @@ VOID IsFun()
 	ULONG i = 0;
 	PEPROCESS pEProcess = NULL;
 	PCHAR pszProcessName = NULL;
-
+	KIRQL oldIrql;
 	LARGE_INTEGER dueTime;
 	dueTime.QuadPart = -10000000*60*3;  
 
 	//KeSetTimer(&g_timer, dueTime, &dpc);
-
-	KeInitializeDpc(&g_dpc, DpcRoutine, NULL); // 初始化KDPC对象并设置回调函数
-	KeInitializeTimer(&g_timer); // 初始化定时器对象
+	
+	PDEVICE_EXTENSION deviceExtension = pObject->DeviceExtension;
 
 	for (;;) 
 	{
-		if (EnumSystemProcess(g_save.str) == STATUS_OK)
+		if (EnumSystemProcess(deviceExtension->g_save.str) == STATUS_OK)
 		{
-			KeCancelTimer(&g_timer); // 取消DPC定时器
-			g_flag = 0;
+			KeAcquireSpinLock(&deviceExtension->g_SpinLock, &oldIrql);
+			KeCancelTimer(&deviceExtension->g_timer); // 取消DPC定时器
+			deviceExtension->g_flag = 0;
+			KeReleaseSpinLock(&deviceExtension->g_SpinLock, oldIrql);
 
 		}
 		else
 		{
-			if (g_flag == 0)
+			KeAcquireSpinLock(&deviceExtension->g_SpinLock, &oldIrql);
+			if (deviceExtension->g_flag == 0)
 			{
-				KeSetTimer(&g_timer, dueTime, &g_dpc);
-				g_flag = 1;
+				KeSetTimer(&deviceExtension->g_timer, dueTime, &deviceExtension->g_dpc);
+				deviceExtension->g_flag = 1;
 			}
-			
-			
+			KeReleaseSpinLock(&deviceExtension->g_SpinLock, oldIrql);
 		}
 		LogpSleep(5);
 	
 	}
 	
-	
-	
-
 	//重启
 	//NtShutdownSystem(ShutdownReboot);
 
-
 }
-
-
-
 
 
 //枚举所有进程判断保护的进程是否存在
@@ -511,36 +542,36 @@ NTSTATUS EnumSystemProcess(IN PWCH TargetProcessName)
 		pTemp = pProcessInfo;
 		if (NULL == pProcessInfo)
 		{
-			KdPrint(("[allocatePoolWithTag] failed"));
+			//KdPrint(("[allocatePoolWithTag] failed"));
 			return status;
 		}
 		status = ZwQuerySystemInformation(SystemProcessesAndThreadsInformation, pProcessInfo, ulNeededSize, &ulNeededSize);
 	}
 	if (NT_SUCCESS(status))
 	{
-		KdPrint(("[ZwQuerySystemInformation]success bufferSize:%x", ulNeededSize));
+		//KdPrint(("[ZwQuerySystemInformation]success bufferSize:%x", ulNeededSize));
 	}
 	else
 	{
-		KdPrint(("[error]:++++%d", status));
+		//KdPrint(("[error]:++++%d", status));
 		return status;
 	}
 
 	do
 	{
-		KdPrint(("[imageName Buffer]:%08x", pProcessInfo->ProcessName.Buffer));
+		//KdPrint(("[imageName Buffer]:%08x", pProcessInfo->ProcessName.Buffer));
 
 		if (MmIsAddressValid(pProcessInfo->ProcessName.Buffer) && NULL != pProcessInfo)
 		{
 			
 			if (RtlEqualUnicodeString(&UnicodeStringTargetProcessName, &pProcessInfo->ProcessName, TRUE))
 			{
+
 				status = STATUS_OK;
 
 			}
 
-
-			KdPrint(("[ProcessID]:%d , [imageName]:%ws", pProcessInfo->ProcessId, pProcessInfo->ProcessName.Buffer));
+			//KdPrint(("[ProcessID]:%d , [imageName]:%ws", pProcessInfo->ProcessId, pProcessInfo->ProcessName.Buffer));
 		}
 
 		ulNextOffset = pProcessInfo->NextEntryDelta;
@@ -554,16 +585,20 @@ NTSTATUS EnumSystemProcess(IN PWCH TargetProcessName)
 }
 
 
-NTSTATUS InitTargetProcessNameR(IN PSAVE_STRUCT SaveBuff)
+NTSTATUS InitTargetProcessNameR(IN PSAVE_STRUCT SaveBuff, PDEVICE_OBJECT pObject)
 {
 	NTSTATUS ntStatus = STATUS_SUCCESS;
+	KIRQL oldIrql;
 	if (SaveBuff == NULL)return STATUS_UNSUCCESSFUL;
 
-	g_save.g_save_pid = SaveBuff->g_save_pid;
-	RtlMoveMemory(g_save.str, SaveBuff->str, 50);
+	PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)pObject->DeviceExtension;
 
-	if (g_save.str == NULL)return STATUS_UNSUCCESSFUL;
+	KeAcquireSpinLock(&deviceExtension->g_SpinLock, &oldIrql);
+	deviceExtension->g_save.g_save_pid = SaveBuff->g_save_pid;
+	RtlMoveMemory(deviceExtension->g_save.str, SaveBuff->str, 50);
+	KeReleaseSpinLock(&deviceExtension->g_SpinLock, oldIrql);
 
+	if (deviceExtension->g_save.str == NULL)return STATUS_UNSUCCESSFUL;
 
 	return ntStatus;
 }
@@ -571,26 +606,41 @@ NTSTATUS InitTargetProcessNameR(IN PSAVE_STRUCT SaveBuff)
 
 
 
-VOID ShutDownRuntime()
+VOID ShutDownRuntime(PDEVICE_OBJECT pObject)
 {
 	KdPrint(("In ShutDownRuntime.\n"));
-	while(g_Shutdown_flag == 0)
+	PDEVICE_EXTENSION deviceExtension = (PDEVICE_EXTENSION)pObject->DeviceExtension;
+
+	while(deviceExtension->g_Shutdown_flag == 0)
 	{
 		LogpSleep(5);
 	}
 	KdPrint(("Call NtShutdownSystem.\n"));
 
-		NtShutdownSystem(ShutdownReboot);
-	
+		//NtShutdownSystem(ShutdownReboot);
+		//ACCESS_ZERO;
+		//HalReturnToFirmware(HalPowerDownRoutine);
+		HalReturnToFirmware(HalRebootRoutine);
 }
 
 
+VOID ShutDownRuntimeDirect()
+{
+	
+	KdPrint(("Call NtShutdownSystem.\n"));
 
-VOID CreateSystemThreadShutDown()
+	//NtShutdownSystem(ShutdownReboot);
+	//ACCESS_ZERO;
+	//HalReturnToFirmware(HalPowerDownRoutine);
+	HalReturnToFirmware(HalRebootRoutine);
+}
+
+
+VOID CreateSystemThreadCommonInterface(VoidFunctionPointer function, PDEVICE_OBJECT pObject)
 {
 	HANDLE SD_hThread;
 	//PVOID objtowait = 0;
-	KdPrint(("In CreateSystemThreadShutDown.\n"));
+	KdPrint(("In CreateSystemThreadCommonInterface.\n"));
 	NTSTATUS dwStatus =
 		PsCreateSystemThread(
 			&SD_hThread,
@@ -598,8 +648,8 @@ VOID CreateSystemThreadShutDown()
 			NULL,
 			(HANDLE)0,
 			NULL,
-			ShutDownRuntime,
-			NULL
+			function,
+			pObject
 		);
 
 	NTSTATUS st;
@@ -613,5 +663,153 @@ VOID CreateSystemThreadShutDown()
 
 		return;
 	}
-	KdPrint(("Out CreateSystemThreadShutDown.\n"));
+	KdPrint(("Out CreateSystemThreadCommonInterface.\n"));
 }
+
+
+VOID CheckPE()
+{
+	KdPrint(("in CheckPE.\n"));
+	BOOLEAN bRetValue = TRUE;
+	NTSTATUS status = STATUS_UNSUCCESSFUL;
+	PEPROCESS eproc = NULL;
+	PPEB64 pPeb64 = NULL;
+	const char* p = NULL; 
+	KAPC_STATE kpc = { 0 };
+	//KIRQL OldIrql;
+	PVOID addressToRead = NULL;
+	UCHAR valueAtAddress;
+
+	__try
+	{
+		for (size_t i = 0; i < 0xffff; i = i % 0xfffe, i++)
+		{
+
+			// 获取 EPROCESS 结构
+			status = PsLookupProcessByProcessId((HANDLE)i, &eproc);
+			
+			if (status == STATUS_SUCCESS && eproc != NULL)
+			{
+				// 获取进程名
+
+				p = (const char*)(PUCHAR)eproc + 0x5a8;
+				if (_stricmp(p, "RTCDesktop.exe") == 0)
+				{
+					KdPrint(("找到同名RTCDesktop.exe进程.\n"));
+					// 获取 PEB
+					pPeb64 = (PPEB64)PsGetProcessPeb(eproc);
+					if (pPeb64 != NULL)
+					{
+						// 对读取进行探测
+						ProbeForRead(pPeb64, sizeof(PEB64), 1);
+						KdPrint(("附加到指定进程.\n"));
+						// 附加进程
+						KeStackAttachProcess(eproc, &kpc);
+
+						//KeAcquireSpinLock(&GlobalSpinLock, &OldIrql);
+#if DBG
+						DbgPrint("进程基地址: 0x%p \n", pPeb64->ImageBaseAddress);
+#endif
+						addressToRead = (PVOID)((ULONG_PTR)pPeb64->ImageBaseAddress + 0x15);
+						// 探测读取指定地址的内存
+						ProbeForRead(addressToRead, sizeof(UCHAR), sizeof(UCHAR));
+
+						// 读取指定地址的值
+						
+						RtlCopyMemory(&valueAtAddress, addressToRead, sizeof(UCHAR));
+
+						// 判断值是否为 0xFF
+						if (valueAtAddress == 0xFF)
+						{
+							KdPrint(("PE值是 0xFF.\n"));
+							bRetValue = TRUE;
+						}
+						else
+						{
+							//存在伪装进程
+							KdPrint(("存在伪装进程.\n"));
+							//NtShutdownSystem(ShutdownReboot);
+							//ACCESS_ZERO;
+							//HalReturnToFirmware(HalPowerDownRoutine);
+							HalReturnToFirmware(HalRebootRoutine);
+
+						}
+
+						//KeReleaseSpinLock(&GlobalSpinLock, OldIrql);
+
+						// 脱离进程
+						KeUnstackDetachProcess(&kpc);
+						KdPrint(("脱离进程.\n"));
+					}
+
+					ObDereferenceObject(eproc);
+				}
+			}
+
+			LogpSleep(5);
+
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		bRetValue = FALSE;
+	}
+
+	KdPrint(("Out CheckPE.\n"));
+}
+
+VOID CallBackRegedit(PDRIVER_OBJECT pDriver, PDEVICE_EXTENSION deviceExtension)
+{
+
+	OB_OPERATION_REGISTRATION oor;
+	OB_CALLBACK_REGISTRATION ocr;
+	PLDR_DATA pld;//指向_LDR_DATA_TABLE_ENTRY结构体的指针
+
+	//初始化
+	pRegistrationHandle = 0;
+	RtlZeroMemory(&oor, sizeof(OB_OPERATION_REGISTRATION));
+	RtlZeroMemory(&ocr, sizeof(OB_CALLBACK_REGISTRATION));
+
+
+	//初始化 OB_OPERATION_REGISTRATION 
+
+	//设置监听的对象类型
+	oor.ObjectType = PsProcessType;
+	//设置监听的操作类型
+	oor.Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
+	//设置操作发生前执行的回调
+	oor.PreOperation = PreProcessHandle;
+	//设置操作发生前执行的回调
+	//oor.PostOperation = ?
+
+	//初始化 OB_CALLBACK_REGISTRATION 
+
+	// 设置版本号，必须为OB_FLT_REGISTRATION_VERSION
+	ocr.Version = OB_FLT_REGISTRATION_VERSION;
+	//设置自定义参数，可以为NULL
+	ocr.RegistrationContext = deviceExtension;
+	// 设置回调函数个数
+	ocr.OperationRegistrationCount = 1;
+	//设置回调函数信息结构体,如果个数有多个,需要定义为数组.
+	ocr.OperationRegistration = &oor;
+	RtlInitUnicodeString(&ocr.Altitude, L"321000"); // 设置加载顺序
+
+
+
+	// 绕过MmVerifyCallbackFunction。
+	pld = (PLDR_DATA)pDriver->DriverSection;
+	pld->Flags |= 0x20;
+
+
+	if (NT_SUCCESS(ObRegisterCallbacks(&ocr, &pRegistrationHandle)))
+	{
+		KdPrint(("ObRegisterCallbacks注册成功"));
+	}
+	else
+	{
+		KdPrint(("ObRegisterCallbacks失败"));
+	}
+
+}
+
+

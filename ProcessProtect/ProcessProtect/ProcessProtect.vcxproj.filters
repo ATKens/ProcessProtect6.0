@@ -35,5 +35,8 @@
     <ClInclude Include="ProcessInformation.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="peb.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>

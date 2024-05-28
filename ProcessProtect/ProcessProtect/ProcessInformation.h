@@ -40,3 +40,15 @@ NTAPI ZwQuerySystemInformation(
     IN ULONG SystemInformationLength,
     OUT PULONG ReturnLength
 );
+
+
+
+
+
+
+
+
+
+
+
+
