@@ -17,6 +17,8 @@
 #define CTL_REBOOT MYIOCTRL_CODE(1)
 #define CTL_CHECK_PE MYIOCTRL_CODE(2)
 #define CTL_BYE MYIOCTRL_CODE(3)
+#define CTL_HEARTBEAT MYIOCTRL_CODE(4)
+
 
 #pragma warning(disable : 4996)
 
@@ -244,6 +246,72 @@ EXTERN_C BOOL __cdecl DeviceControlCommonInterface(char* lpszDriverName,DWORD co
 
 	return (bResult);
 }
+
+
+
+
+
+/**
+ * 向设备驱动程序发送控制代码CTL_HEARTBEAT，CTL_HEARTBEAT就是心跳的方式判断RTCDesktop.exe是否存活的功能
+ *
+ * @param lpszDriverName 驱动名称
+ * @param control_code  设备控制请求的控制码
+ * @return 设备控制请求返回的布尔值
+ *
+ */
+EXTERN_C BOOL __cdecl DeviceControlHeartbeat(char* lpszDriverName)
+{
+	BOOL bResult = FALSE;                 // results flag
+	DWORD junk = 0;                     // discard results
+
+	static bool done = false;
+
+	if (!done) {
+		std::string className = "\\\\.\\";
+		className += lpszDriverName;
+
+		printf("c_str:%s\n", className.c_str());
+		drvhandle = CreateFileA(className.c_str(),
+			GENERIC_WRITE | GENERIC_READ,
+			0,
+			NULL,
+			OPEN_EXISTING,
+			FILE_ATTRIBUTE_NORMAL,
+			NULL);
+
+
+		INT32 error_code = GetLastError();
+
+		if (INVALID_HANDLE_VALUE == drvhandle)
+		{
+			printf("CreateFile失败!%08X\n", error_code);
+			return bResult;
+		}
+		done = true;
+	}
+
+		bResult = DeviceIoControl(drvhandle,                       // device to be queried
+			CTL_HEARTBEAT, // operation to perform
+			&g_save, sizeof(SAVE_STRUCT),                       // no input buffer
+			NULL, 0,            // output buffer
+			&junk,                         // # bytes returned
+			NULL);          // synchronous I/O
+
+		printf("bResult:%b", bResult);
+
+		if (!bResult) {
+			printf("Error sending heartbeat: %lu\n", GetLastError());
+			return bResult;
+		}
+		printf("Heartbeat sent.\n");
+		
+
+	
+	return bResult;
+}
+
+
+
 
 
 /**

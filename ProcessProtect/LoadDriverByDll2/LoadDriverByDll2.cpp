@@ -21,6 +21,8 @@ extern "C" typedef BOOL(__cdecl* DeviceControl)(_In_ char* lpszDriverName, _In_ 
 extern "C" typedef BOOL(__cdecl* PsProtectBegin)(char* lpszDriverName);
 extern "C" typedef BOOL(__cdecl* DeviceControlCommonInterface)(char* lpszDriverName, DWORD control_code);
 
+extern "C" typedef BOOL(__cdecl* DeviceControlHeartbeat)(char* lpszDriverName);
+
 
 #define IOCTRL_BASE 0x800
 
@@ -31,7 +33,7 @@ extern "C" typedef BOOL(__cdecl* DeviceControlCommonInterface)(char* lpszDriverN
 #define CTL_REBOOT MYIOCTRL_CODE(1)
 #define CTL_CHECK_PE MYIOCTRL_CODE(2)
 #define CTL_BYE MYIOCTRL_CODE(3)
-
+#define CTL_HEARTBEAT MYIOCTRL_CODE(4)
 
 
 typedef struct _SAVE_STRUCT
@@ -55,11 +57,16 @@ int main(int argc, char* argv[])
 	LoadDriverFunction((char*)"ProcessProtect", (char*)"ProcessProtect.sys");//1.加载驱动
 
 	//CTL_START控制指令，检测RTCDesktop.exe是否存在，不存在则3min后重启
-	DeviceControlFunction((char*)"ProcessProtect", (LPWSTR)L"RTCDesktop.exe", GetCurrentProcessId());
+	//DeviceControlFunction((char*)"ProcessProtect", (LPWSTR)L"RTCDesktop.exe", GetCurrentProcessId());
 
-	DeviceControlCommonInterface f = (DeviceControlCommonInterface)GetProcAddress(_hDllInst, "DeviceControlCommonInterface");
+	DeviceControlHeartbeat f = (DeviceControlHeartbeat)GetProcAddress(_hDllInst, "DeviceControlHeartbeat");
 
-	f((char*)"ProcessProtect", CTL_CHECK_PE);//CTL_CHECK_PE控制指令，检测是否存在伪装进程,如果存在，则会直接重启
+	while (true)
+	{
+		f((char*)"ProcessProtect");//CTL_CHECK_PE控制指令，检测是否存在伪装进程,如果存在，则会直接重启
+		Sleep(5000);
+	}
+	
 
 	//f((char*)"ProcessProtect", CTL_REBOOT);//CTL_REBOOT控制指令,调用将会直接重启
 	
